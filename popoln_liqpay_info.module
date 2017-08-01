@@ -310,7 +310,7 @@ function liqpay_form($form, &$form_state) {
   $data_ex = base64_encode( $json_string );
   $signature = base64_encode( sha1( $private_key . $data_ex . $private_key, 1 ) );
 
-  $form['#action'] = url('https://www.liqpay.com/api/3/checkout');
+  $form['#action'] = url('https://www.liqpay.ua/api/3/checkout');
 
   $form['data'] = array(
     '#type' => 'hidden',
