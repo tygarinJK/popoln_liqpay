@@ -1,0 +1,7 @@
+name = LiqPay Info Module
+description = Recive payment logs from LiqPay API
+core = 7.x
+
+dependencies[] = variable
+package = Popolnenie
+configure = admin/config/services/liqpay-gateway

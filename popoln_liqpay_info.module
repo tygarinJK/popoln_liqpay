@@ -1,0 +1,343 @@
+<?php
+
+/**
+ * Implements hook_menu_alter.
+ * Check access for liqpay menu item.
+ */
+function popoln_liqpay_info_menu_alter(&$items) {
+  $items['liqpay-gate'] = array(
+    'title' => 'Page Liqpay',
+    'page callback' => 'popoln_payment_recive',
+    'access callback' => TRUE,
+    'expanded' => TRUE,
+  );
+
+  $items['admin/config/services/liqpay-gateway'] = array(
+    'title' => 'LiqPay Gateway',
+    'description' => t('LiqPay Gateway configuration page'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('variable_module_form', 'popoln_liqpay_info'),
+    'access arguments' => array('administer site settings'),
+  );
+
+  $items['rest/payment-settings'] = array(
+    'title' => 'REST Settings',
+    'page callback' => 'popoln_liqpay_info_payment_settings_rest_output',
+    'access arguments' => array('access content'),
+  );
+
+  $items['liqpay-form'] = array(
+    'title' => 'LiqPay Form',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('liqpay_form'),
+    'access callback' => TRUE
+  );
+
+  return $items;
+}
+
+/**
+ * Callback to payment recive.
+ */
+function popoln_payment_recive(){
+  
+  if ( isset($_POST['data']) ) {
+  	$data = $_POST['data'];
+
+  	$data_json = base64_decode( $data );
+  	$data_arr = json_decode( $data_json, TRUE );
+
+
+  	// -- watchdog log
+  	if ( array_key_exists('sandbox', $data_arr) ) {
+  		$message = '"payment_id":'.$data_arr['payment_id'].',"sandbox":'.$data_arr['sandbox'].',"order_id":'.$data_arr['order_id'].',"liqpay_order_id":'.$data_arr['liqpay_order_id'];
+
+  		watchdog('Liqpay Payment', 'Liqpay Responds :' . $message );
+  	}
+  	elseif ( array_key_exists('status', $data_arr) ) {
+  		$message = '"payment_id":'.$data_arr['payment_id'].',"status":'.$data_arr['status'].',"order_id":'.$data_arr['order_id'].',"liqpay_order_id":'.$data_arr['liqpay_order_id'];
+
+  		watchdog('Liqpay Payment', 'Liqpay Responds :' . $message );
+  	}
+
+
+    // -- payment node creation
+    /**
+     * If responce descripnion has new format ('AC588; 380955326255; 50UAH'), parse data
+     * @var $descr
+     * 
+     * Else parse old format data
+     * @var $descr_arr
+     *
+     */
+  	$query = new EntityFieldQuery();
+    $query->entityCondition('entity_type', 'node')
+      ->entityCondition('bundle', 'mob_payment')
+      ->fieldCondition('field_mp_order_id', 'value', $data_arr['order_id'], '=')
+      ->addMetaData('account', user_load(1));
+
+    $result = $query->execute();
+
+    if (!isset($result['node'])) {
+
+      $el = explode(';', $data_arr['description']);
+      $el = array_map('trim', $el);
+
+      if (count($el) > 0) {
+        $descr['uid'] = substr($el[0], 2);
+        $descr['phone_num'] = $el[1];
+        $descr['amount'] = floatval($el[2]);
+
+        $descr_arr = $descr;
+      }
+      else $descr_arr = json_decode( $data_arr['description'], TRUE );
+
+      // uid
+      $uid = array_key_exists( 'uid',$descr_arr ) && $descr_arr['uid'] !== "" ? $descr_arr['uid'] : 0;
+
+      // amount
+      $amount = array_key_exists('amount', $descr_arr) ? $descr_arr['amount'] : '';
+
+      // transaction
+      if ( $data_arr['status'] === "success" ) $transaction = '1';
+      elseif ( $data_arr['status'] === "failure" ) $transaction = '3';
+      elseif ( $data_arr['status'] === "sandbox" ) $transaction = '4';
+      elseif ( $data_arr['status'] === "wait_accept" ) $transaction = '5';
+      elseif ( $data_arr['status'] === "reversed" ) $transaction = '9';
+      elseif ( $data_arr['status'] === "error" ) $transaction = '10';
+      else $transaction = '11';
+
+
+      $node = new stdClass();
+      $node->uid = $uid;
+      $node->status = 1;
+      $node->promote = 0;
+      $node->type = 'mob_payment';
+      $node->language = LANGUAGE_NONE;
+      $node->title = $data_arr['order_id'];
+      $node->field_mp_order_id[$node->language][]['value'] = $data_arr['order_id'];
+      $node->field_mp_phone_number[$node->language][]['value'] = $descr_arr['phone_num'];
+      $node->field_mp_raw_amount[$node->language][]['value'] = $descr_arr['amount'];
+      $node->field_mp_amount[$node->language][]['value'] = $data_arr['amount'];
+      $node->field_mp_currency[$node->language][]['value'] = $data_arr['currency'];
+      $node->field_mp_transaction_status[$node->language][]['tid'] = $transaction;
+      // $node->field_mp_refill_status[$node->language][]['tid'] = $refill;
+      $node->field_mp_timestamp[$node->language][] = array(
+        'value' => format_date( round( intval($data_arr['create_date']) / 1000 ), 'custom', 'Y-m-d H:i:s', 'UTC'),
+        'timezone' => 'UTC',  
+        'timezone_db' => 'UTC',
+      );
+      $node->field_mp_raw_responce[$node->language][]['value'] = $data_json;
+      $node = node_submit($node);
+
+
+      if ( $data_arr['status'] === "success" ) {
+        // -- Privat Bank Payment
+        $payment_id = uniqid("");
+        $phone = '+'.$descr_arr['phone_num'];
+        $url = 'https://api.privatbank.ua/p24api/directfill';
+
+        if (isset($descr['amount'])) $amount = $descr['amount'];
+        else {
+          $raw_amount = $data_arr['amount'];
+          $tax_pb = ceil($raw_amount / 50);
+          $raw_amount = $raw_amount - $tax_pb;
+          $tax_popoln = floatval(variable_get_value('payment_settings:resource_tax'));
+          $raw_amount = $raw_amount - (($raw_amount / 100) * $tax_popoln);
+          $tax_lp = floatval('2.75');
+
+          $amount = $raw_amount - (($raw_amount / 100) * $tax_lp);
+          $amount = round($amount, 2, PHP_ROUND_HALF_UP);
+        }
+        
+        $sandbox = strval( variable_get_value('payment_settings:sandbox') );
+
+        $data = '<oper>cmt</oper><wait>10</wait><test>'.$sandbox.'</test><payment id="'.$payment_id.'"><prop name="phone" value="'.$phone.'" /><prop name="amt" value="'.$amount.'" /></payment>';
+
+        $password = variable_get_value('privat_bank:password');
+        $merchant_id = variable_get_value('privat_bank:merchant_id');
+        $sign = sha1(md5($data.$password));
+
+        $xml = '<?xml version="1.0" encoding="UTF-8"?>';
+        $xml .='<request version="1.0">';
+        $xml .=' <merchant>';
+        $xml .='   <id>'.$merchant_id.'</id>';
+        $xml .='   <signature>'.$sign.'</signature>';
+        $xml .=' </merchant>';
+        $xml .=' <data>'.$data.'</data>';
+        $xml .='</request>';
+
+        $ch = curl_init();
+
+        curl_setopt($ch, CURLOPT_URL,            $url );
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1 );
+        curl_setopt($ch, CURLOPT_POST,           1 );
+        curl_setopt($ch, CURLOPT_POSTFIELDS,     $xml ); 
+        curl_setopt($ch, CURLOPT_HTTPHEADER,     array('Content-Type: text/plain')); 
+
+        $result = curl_exec ($ch);
+         
+        curl_close($ch);
+
+        $oXML = new SimpleXMLElement($result);
+        $payment = $oXML->data->payment;
+
+        if (isset($payment)) {
+          $payment = (array) $payment;
+
+          if ( $payment['@attributes']['state'] == '1' ) $refill = '8';
+          else $refill = '7';
+
+          $node->field_mp_modilepayment_id['und'][0]['value'] = $payment_id;
+        }
+        else $refill = '14';
+
+        $node->field_mp_refill_status['und'][0]['tid'] = $refill;
+        $node->field_mp_raw_directfill['und'][0]['value'] = print_r($oXML, true);
+      }
+      node_save($node);
+    }
+  }
+}
+
+/*
+ * Implements hook_cron().
+ */
+function popoln_liqpay_info_cron(){
+  $query = new EntityFieldQuery();
+
+  $query->entityCondition('entity_type', 'node')
+  ->entityCondition('bundle', 'mob_payment')
+  ->propertyCondition('status', NODE_PUBLISHED)
+  ->fieldCondition('field_mp_refill_status', 'tid', '8')
+  ->addTag('DANGEROUS_ACCESS_CHECK_OPT_OUT')
+  ->addMetaData('account', user_load(1)); // Run the query as user 1.
+
+  $result = $query->execute();
+
+  // Run if resul is not empty
+  if (isset($result['node'])) {
+    $items_nids = array_keys($result['node']);
+
+    $queue = DrupalQueue::get('check_status');
+    foreach ($items_nids as $data) {
+      $queue->createItem($data);
+    }
+  }
+}
+
+/**
+ * Implements hook_cron_queue_info().
+ */
+function popoln_liqpay_info_cron_queue_info(){
+  $queues['check_status'] = array(
+    'worker callback' => 'popoln_liqpay_info_change_refill_status',
+    'time' => 30,
+  );
+
+  return $queues;
+}
+
+function popoln_liqpay_info_change_refill_status($data) {
+
+  $node = node_load($data);
+
+  // -- Privat Bank Payment
+  if (isset($node->field_mp_modilepayment_id['und'][0]['value'])) {
+
+    $payment_id = $node->field_mp_modilepayment_id['und'][0]['value'];
+    $url = 'https://api.privatbank.ua/p24api/check_directfill';
+
+    $sandbox = strval( variable_get_value('payment_settings:sandbox') );
+
+    $data = '<oper>cmt</oper><wait>10</wait><test>'.$sandbox.'</test><payment><prop name="id" value="'.$payment_id.'" /></payment>';
+
+    $password = variable_get_value('privat_bank:password');
+    $merchant_id = variable_get_value('privat_bank:merchant_id');
+    $sign = sha1(md5($data.$password));
+
+    $xml = '<?xml version="1.0" encoding="UTF-8"?>';
+    $xml .='<request version="1.0">';
+    $xml .=' <merchant>';
+    $xml .='   <id>'.$merchant_id.'</id>';
+    $xml .='   <signature>'.$sign.'</signature>';
+    $xml .=' </merchant>';
+    $xml .=' <data>'.$data.'</data>';
+    $xml .='</request>';
+
+    $ch = curl_init();
+
+    curl_setopt($ch, CURLOPT_URL,            $url );
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1 );
+    curl_setopt($ch, CURLOPT_POST,           1 );
+    curl_setopt($ch, CURLOPT_POSTFIELDS,     $xml ); 
+    curl_setopt($ch, CURLOPT_HTTPHEADER,     array('Content-Type: text/plain')); 
+
+    $result = curl_exec ($ch);
+     
+    curl_close($ch);
+
+    $oXML = new SimpleXMLElement($result);
+    $payment = $oXML->data->payment;
+
+    if (isset($payment)) {
+      $payment = (array) $payment;
+
+      if ( $payment['@attributes']['state'] == 'snd' ) $refill = '8';
+      elseif ( $payment['@attributes']['state'] == 'ok' ) $refill = '6';
+      elseif ( $payment['@attributes']['state'] == 'err' ) $refill = '7';
+      elseif ( $payment['@attributes']['state'] == 'no' ) $refill = '12';
+      else $refill = '14';
+    }
+    else $refill = '14';
+
+    $node->field_mp_refill_status['und'][0]['tid'] = $refill;
+    $node->field_mp_raw_status_response_pb['und'][0]['value'] = print_r($oXML, true);
+  }
+
+  node_save($node);
+}
+
+/**
+ * LiqPay custom form.
+ */
+function liqpay_form($form, &$form_state) {
+  $order_id = uniqid("cf_");
+
+  $private_key = 'Hw2zNFF3xLNpJk81H7HhThSDFxl2IDIg8Lrgxk53';
+  $json_string = '{"version":"3","public_key":"i21628189765","phone":"380955326255","action":"pay","amount":"2.02","currency":"UAH","sandbox":"1","description":"AC1; 380955326255; 0.10UAH","server_url":"http://popolnalka.art-coral.com/liqpay-gate","order_id":"'.$order_id.'"}';
+
+  $data_ex = base64_encode( $json_string );
+  $signature = base64_encode( sha1( $private_key . $data_ex . $private_key, 1 ) );
+
+  $form['#action'] = url('https://www.liqpay.com/api/3/checkout');
+
+  $form['data'] = array(
+    '#type' => 'hidden',
+    '#value' => $data_ex,
+  );
+
+  $form['signature'] = array(
+    '#type' => 'hidden',
+    '#value' => $signature,
+  );
+
+  $form['actions']['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Send'),
+  );
+
+  return $form; 
+}
+
+/**
+ * REST Payment service settings output.
+ */
+function popoln_liqpay_info_payment_settings_rest_output(){
+  $vars['version']['aos'] = variable_get_value('version:aos');
+  $vars['payment_settings']['service_block'] = variable_get_value('payment_settings:service_block');
+  $vars['payment_settings']['resource_tax'] = variable_get_value('payment_settings:resource_tax');
+  $vars['payment_settings']['sandbox'] = variable_get_value('payment_settings:sandbox');
+
+  print json_encode($vars);
+}
